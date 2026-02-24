@@ -1,6 +1,7 @@
 ---
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+title: LMCache
 ---
 
 # LMCache Integration in Dynamo
@@ -87,7 +88,7 @@ This will:
 - **Purpose**: Handles prompt processing (prefill phase)
 - **GPU Assignment**: CUDA_VISIBLE_DEVICES=1
 - **LMCache Config**: Uses `MultiConnector` with both LMCache and NIXL connectors. This enables prefill worker to use LMCache for KV offloading and use NIXL for KV transfer between prefill and decode workers.
-- **Flag**: `--is-prefill-worker`
+- **Flag**: `--disaggregation-mode prefill`
 
 ## Architecture
 

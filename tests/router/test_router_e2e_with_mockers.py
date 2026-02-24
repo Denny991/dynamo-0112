@@ -117,7 +117,7 @@ def _build_mocker_command(
         MODEL_NAME,
         "--endpoint",
         endpoint,
-        "--store-kv",
+        "--discovery-backend",
         store_backend,
         "--num-workers",
         str(num_workers),
@@ -125,9 +125,9 @@ def _build_mocker_command(
 
     # Add worker type flag for disaggregated mode
     if worker_type == "prefill":
-        command.append("--is-prefill-worker")
+        command.extend(["--disaggregation-mode", "prefill"])
     elif worker_type == "decode":
-        command.append("--is-decode-worker")
+        command.extend(["--disaggregation-mode", "decode"])
 
     # Add individual CLI arguments from mocker_args
     if "speedup_ratio" in mocker_args:
@@ -479,15 +479,15 @@ def test_mocker_kv_router_overload_503(
 @pytest.mark.parametrize(
     "durable_kv_events", [False], indirect=True
 )  # Use NATS Core (local indexer)
-def test_kv_push_router_bindings(
+def test_kv_router_bindings(
     request,
     runtime_services_dynamic_ports,
     predownload_tokenizers,
     request_plane,
     durable_kv_events,
 ):
-    """Test KvPushRouter Python bindings with mocker engines."""
-    logger.info("Starting KvPushRouter bindings test")
+    """Test KvRouter Python bindings with mocker engines."""
+    logger.info("Starting KvRouter bindings test")
     # Use local indexer (NATS Core mode)
     mocker_args = {
         "speedup_ratio": SPEEDUP_RATIO,
@@ -507,9 +507,9 @@ def test_kv_push_router_bindings(
 
         # Get runtime and create endpoint
         runtime = get_runtime(request_plane=request_plane)
-        namespace = runtime.namespace(mockers.namespace)
-        component = namespace.component(mockers.component_name)
-        endpoint = component.endpoint("generate")
+        endpoint = runtime.endpoint(
+            f"{mockers.namespace}.{mockers.component_name}.generate"
+        )
 
         # Run Python router bindings test
         _test_python_router_bindings(
@@ -537,7 +537,7 @@ def test_kv_push_router_bindings(
     ],
     indirect=["request_plane", "durable_kv_events"],
 )
-@pytest.mark.timeout(180)  # bumped for xdist contention (was 90s; up to 33s under load)
+@pytest.mark.timeout(180)
 def test_indexers_sync(
     request,
     runtime_services_dynamic_ports,
@@ -620,7 +620,6 @@ def test_query_instance_id_returns_worker_and_tokens(
         "block_size": BLOCK_SIZE,
         "durable_kv_events": durable_kv_events,
     }
-    os.makedirs(request.node.name, exist_ok=True)
 
     with MockerProcess(
         request, mocker_args=mocker_args, num_mockers=NUM_MOCKERS
@@ -698,9 +697,7 @@ def test_router_decisions(
         # Get runtime and create endpoint
         runtime = get_runtime(request_plane=request_plane)
         # Use the namespace from the mockers
-        namespace = runtime.namespace(mockers.namespace)
-        component = namespace.component("mocker")
-        endpoint = component.endpoint("generate")
+        endpoint = runtime.endpoint(f"{mockers.namespace}.mocker.generate")
 
         _test_router_decisions(
             mockers,

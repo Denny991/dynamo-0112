@@ -5,6 +5,7 @@ import argparse
 import logging
 import os
 import socket
+import warnings
 from typing import Any, Dict, Optional
 
 from vllm.config import KVTransferConfig
@@ -21,7 +22,9 @@ from dynamo.common.configuration.groups.runtime_args import (
     DynamoRuntimeArgGroup,
     DynamoRuntimeConfig,
 )
+from dynamo.common.utils.runtime import parse_endpoint
 from dynamo.vllm.backend_args import DynamoVllmArgGroup, DynamoVllmConfig
+from dynamo.vllm.constants import DisaggregationMode
 
 from . import envs
 
@@ -33,11 +36,8 @@ VALID_CONNECTORS = {"nixl", "lmcache", "kvbm", "null", "none"}
 
 class Config(DynamoRuntimeConfig, DynamoVllmConfig):
     component: str
-    endpoint: str
-    is_prefill_worker: bool
-    is_decode_worker: bool
     custom_jinja_template: Optional[str] = None
-    store_kv: str
+    discovery_backend: str
     request_plane: str
     event_plane: str
     enable_local_indexer: bool = True
@@ -79,13 +79,13 @@ def parse_args() -> Config:
     Returns:
         Config: Parsed configuration object.
     """
-
     dynamo_runtime_argspec = DynamoRuntimeArgGroup()
     dynamo_vllm_argspec = DynamoVllmArgGroup()
 
     parser = argparse.ArgumentParser(
         description="Dynamo vLLM worker configuration",
         formatter_class=argparse.RawTextHelpFormatter,
+        allow_abbrev=False,
     )
 
     # Build argument parser
@@ -153,32 +153,40 @@ def update_dynamo_config_with_engine(
     else:
         dynamo_config.served_model_name = None
 
-    # TODO: move to "disaggregation_mode" as the other engines.
-    if dynamo_config.multimodal_processor or dynamo_config.ec_processor:
+    # Capture user-provided --endpoint before defaults overwrite it
+    user_endpoint = dynamo_config.endpoint
+
+    if dynamo_config.route_to_encoder:
         dynamo_config.component = "processor"
         dynamo_config.endpoint = "generate"
-    elif (
-        dynamo_config.vllm_native_encoder_worker
-        or dynamo_config.multimodal_encode_worker
-        or dynamo_config.multimodal_encode_prefill_worker
-    ):
+    elif dynamo_config.multimodal_encode_worker:
         dynamo_config.component = "encoder"
         dynamo_config.endpoint = "generate"
     elif dynamo_config.multimodal_decode_worker:
         dynamo_config.component = "decoder"
         dynamo_config.endpoint = "generate"
-    elif dynamo_config.multimodal_worker and dynamo_config.is_prefill_worker:
+    elif (
+        dynamo_config.multimodal_worker
+        and dynamo_config.disaggregation_mode == DisaggregationMode.PREFILL
+    ):
         dynamo_config.component = "backend"
         dynamo_config.endpoint = "generate"
     elif dynamo_config.omni:
         dynamo_config.component = "backend"
         dynamo_config.endpoint = "generate"
-    elif dynamo_config.is_prefill_worker:
+    elif dynamo_config.disaggregation_mode == DisaggregationMode.PREFILL:
         dynamo_config.component = "prefill"
         dynamo_config.endpoint = "generate"
     else:
         dynamo_config.component = "backend"
         dynamo_config.endpoint = "generate"
+
+    # If user provided --endpoint, override namespace/component/endpoint
+    if user_endpoint is not None:
+        parsed_ns, parsed_comp, parsed_ep = parse_endpoint(user_endpoint)
+        dynamo_config.namespace = parsed_ns
+        dynamo_config.component = parsed_comp
+        dynamo_config.endpoint = parsed_ep
 
     if dynamo_config.custom_jinja_template is not None:
         expanded_template_path = os.path.expanduser(
@@ -215,6 +223,14 @@ def update_dynamo_config_with_engine(
                 "Cannot specify both --kv-transfer-config and --connector flags"
             )
         dynamo_config.connector = normalized  # type: ignore[assignment]
+
+    # Validate ModelExpress P2P server URL
+    if getattr(engine_config, "load_format", None) in ("mx-source", "mx-target"):
+        if not dynamo_config.model_express_url:
+            raise ValueError(
+                f"--model-express-url or MODEL_EXPRESS_URL env var is required "
+                f"when using --load-format={engine_config.load_format}"
+            )
 
 
 def update_engine_config_with_dynamo(
@@ -305,11 +321,10 @@ def create_kv_events_config(
     dynamo_config: Config, engine_config: AsyncEngineArgs
 ) -> Optional[KVEventsConfig]:
     """Create KVEventsConfig for prefix caching if needed."""
-    if dynamo_config.is_decode_worker:
+    if dynamo_config.disaggregation_mode == DisaggregationMode.DECODE:
         logger.info(
-            f"Decode worker detected (is_decode_worker={dynamo_config.is_decode_worker}): "
-            "kv_events_config disabled (decode workers don't publish KV events)",
-            dynamo_config.is_decode_worker,
+            "Decode worker detected (disaggregation_mode=decode): "
+            "kv_events_config disabled (decode workers don't publish KV events)"
         )
         return None
 
@@ -331,6 +346,16 @@ def create_kv_events_config(
     # Create default events config for prefix caching
     # TODO: move this to configuration system.
     port = envs.DYN_VLLM_KV_EVENT_PORT
+    warnings.warn(
+        "Automatic KV events configuration is deprecated and will be removed in "
+        "the next release. After that, KV events will be disabled by default "
+        "(matching upstream vLLM). To preserve current behavior, pass "
+        "--kv-events-config explicitly. For example:\n"
+        f'  --kv-events-config \'{{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://*:{port}"}}\'\n'
+        "See docs/pages/backends/vllm/README.md for details.",
+        FutureWarning,
+        stacklevel=2,
+    )
     logger.info(
         f"Using env-var DYN_VLLM_KV_EVENT_PORT={port} to create kv_events_config"
     )
