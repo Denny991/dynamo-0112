@@ -48,28 +48,28 @@ Dynamo由多语言模块组成，核心API层位于Rust的lib/llm中，HTTP服�
 ```mermaid
 graph TB
 subgraph "前端接口"
-HTTP["HTTP服务<br/>OpenAI兼容路由"]
-SSE["SSE流式响应"]
+    HTTP["HTTP服务<br/>OpenAI兼容路由"]
+    SSE["SSE流式响应"]
 end
 subgraph "业务逻辑"
-Router["路由与模板解析"]
-Metrics["指标收集与队列监控"]
-Validation["请求校验"]
+    Router["路由与模板解析"]
+    Metrics["指标收集与队列监控"]
+    Validation["请求校验"]
 end
 subgraph "后端引擎"
-Engines["推理引擎集合"]
-KV["KV缓存与块管理"]
+    Engines["推理引擎集合"]
+    KV["KV缓存与块管理"]
 end
 subgraph "内部通信"
-Codec["TCP/两段消息编解码"]
-RPC["GPU内存服务RPC"]
+    Codec["TCP/两段消息编解码"]
+    RPC["GPU内存服务RPC"]
 end
 HTTP --> Router
 Router --> Validation
 Router --> Metrics
 Validation --> Engines
 Engines --> KV
-HTTP <- --> SSE
+HTTP -.-> SSE
 Engines --> Codec
 Codec --> RPC
 ```
