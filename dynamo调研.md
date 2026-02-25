@@ -95,9 +95,9 @@ NVIDIA Dynamo 是面向大模型推理的分布式推理框架，其核心目标
 
 ---
 
-## 3. 核心组件协作关系
+## 3. 路由核心组件协作关系
 
-当一条请求到来时，五个核心组件按以下方式协作：
+当一条请求到来时，路由核心组件按以下方式协作：
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -164,7 +164,7 @@ NVIDIA Dynamo 是面向大模型推理的分布式推理框架，其核心目标
 - 每个 Worker 维护本地的 KV：
   - Prefill Worker：负责生成**初始 KV**；
   - Decode Worker：在此基础上追加增量 KV；
-- KV 存储于 GPU 显存，通常以“块 / Block”为单位管理；
+- KV 存储于 GPU 显存，通常以“块 / Block”为单位管理；这里有扩充使用其他介质存储如内存，磁盘等
 - 不使用中心化共享存储做中转，减少带宽和延迟瓶颈。
 
 ### 4.2 PrefillRouter 的 KV 感知路由能力
@@ -388,7 +388,7 @@ graph TD
 
 **成本公式**：`cost = overlap_score_weight × prefill_blocks + decode_blocks`
 
-### 应用场景示例
+### 应用场景示例（这里是官方给的例子，并没有完全的pd分离，考虑是worker 既能P也能D）
 
 假设配置 `overlap_score_weight = 1.0`，集群中有 3 个 Worker。路由算法将计算每个 Worker 的**综合成本**（公式：$Cost = \text{weight} \times \text{PrefillBlocks} + \text{DecodeBlocks}$），并选择成本最低的节点。
 
@@ -404,6 +404,68 @@ graph TD
     *   尽管 **W3** 拥有最多的缓存块数（8 个），理论上能带来最高的 KV 命中率（Overlap Score 最高），但其当前的 **Decode 负载偏高**（9 个活跃块）。
     *   在 `overlap_score_weight = 1.0` 的平衡策略下，系统认为 W3 新增请求带来的解码负载压力超过了缓存复用带来的收益。
     *   **W2** 在缓存复用（5 个块）和当前负载（5 个块）之间取得了最佳平衡，因此成为最优调度目标。
+
+---
+
+## 额外内容（旧版的内容）
+```mermaid
+sequenceDiagram
+    participant D as Worker
+    participant Q as PrefillQueue
+    participant P as PrefillWorker
+
+    Note over D: Request is routed to decode
+    D->>D: Decide if prefill should be done locally or remotely
+
+        D->>D: Allocate KV blocks
+        D->>Q: Put RemotePrefillRequest on the queue
+
+        P->>Q: Pull request from the queue
+        P-->>D: Read cached KVs from Decode
+
+        D->>D: Decode other requests
+        P->>P: Run prefill
+        P-->>D: Write prefilled KVs into allocated blocks
+        P->>D: Send completion notification
+        Note over D: Notification received when prefill is done
+        D->>D: Schedule decoding
+```
+
+以下是这段关于 **Dynamo 分离式架构（Disaggregation）** 及其 **条件式分离（Conditional Disaggregation）** 策略：
+
+### Dynamo 分离式架构的四大核心组件
+
+1.  **Worker（通用工作节点）**：负责执行具体的推理任务，既能处理预填充（Prefill）阶段，也能处理解码（Decode）阶段。
+2.  **Prefill Worker（专用预填充节点）**：专门用于执行预填充计算任务的节点，通常针对长序列计算进行了优化。
+3.  **Disaggregated Router（分离式路由器）**：系统的“大脑”，在运行时动态决定某个请求的预填充阶段是在本地（当前 Worker）执行，还是发送到远程（专用 Prefill Worker）执行。
+4.  **Prefill Queue（预填充队列）**：用于缓存发往远程的请求，并在多个专用预填充节点之间进行负载均衡。
+
+### 工作流程
+
+当 **Worker** 接收到一个请求时，流程如下：
+1.  **决策与分配**：首先通过 **分离式路由器** 判断该请求的预填充是本地做还是远程做，并预先分配好 KV Cache 块。
+2.  **远程提交**：如果决定远程执行，Worker 会将该预填充请求推送到 **预填充队列** 中。
+3.  **远程计算**：**Prefill Worker** 从队列中拉取任务，读取 Worker 中已命中前缀缓存（Prefix Cache Hit）的 KV 块，计算剩余的预填充部分，并将计算结果写回给发起请求的 Worker。
+4.  **本地解码**：最后，原 Worker 利用完整的上下文继续完成剩余的解码（Decode）生成过程。
+
+
+### 条件式分离（Conditional Disaggregation）策略
+
+并非所有请求的预填充阶段都需要发送到远程引擎计算。**分离式路由器** 会根据实时的 **预填充长度** 和 **队列状态**，动态决定计算位置。
+
+只有当**同时满足**以下两个条件时，请求才会被发送至远程预填充引擎：
+
+#### 条件 1：未命中缓存的绝对预填充长度超过预设阈值
+
+#### 条件 2：预填充队列中的远程请求数量少于预设阈值
+
+### 总结
+**条件式分离** 机制让 Dynamo 能够灵活应对动态变化的工作负载：
+*   对于**短请求**或**高缓存命中**请求，利用本地资源“捎带”处理，减少网络开销。
+*   对于**长且无缓存**的重负载请求，利用远程专用算力加速。
+*   在**远程节点过载**时，自动降级为本地处理，避免队列拥堵。
+
+这种动态调度策略确保了系统在各种场景下都能保持高性能。
 
 ---
 
@@ -498,44 +560,100 @@ class MyEngineHandler:
 
 ### 8.3 KV 事件发布（启用 KV 感知路由）
 
-若需让自定义引擎参与 KV 缓存感知路由，需在 KV 块分配/驱逐时发布事件：
+自定义引擎需将 KV 块变化通知给 `KvIndexer`，有两种集成方式：
+
+#### 方式一：ZMQ 事件订阅（推荐，vLLM 采用此方式）
+
+引擎通过 ZMQ 发布事件，Dynamo 订阅并转发到 NATS：
+
+```python
+from dynamo.llm import KvEventPublisher, ZmqKvEventPublisherConfig
+
+# 配置 ZMQ 订阅（引擎作为发布者，Dynamo 作为消费者）
+zmq_config = ZmqKvEventPublisherConfig(
+    worker_id=endpoint.connection_id(),
+    kv_block_size=16,
+    zmq_endpoint="tcp://127.0.0.1:5555",  # 引擎的 ZMQ 事件端口
+    enable_local_indexer=True,
+    dp_rank=0,
+)
+
+# KvEventPublisher 订阅 ZMQ 事件，自动转发到 NATS
+kv_publisher = KvEventPublisher(component=component, zmq_config=zmq_config)
+```
+
+**事件流向**：
+```
+自定义引擎 ──ZMQ发布──→ KvEventPublisher ──NATS──→ KvIndexer
+(BlockStored/BlockRemoved)    (Python封装)        (RadixTree索引)
+```
+
+**引擎需实现的 ZMQ 事件格式**（vLLM 兼容）：
+```python
+{
+    "event_type": "BlockStored",      # 或 "BlockRemoved", "AllBlocksCleared"
+    "block_hashes": [hash1, hash2],   # 序列累积哈希（前缀匹配用）
+    "token_ids": [1, 2, 3, ...],      # 该块的 token ID 列表
+    "parent_hash": parent_hash,       # 父块哈希（首块为 null）
+    "lora_id": 0,                     # LoRA 适配器 ID（无则为 0）
+}
+```
+
+**特点**：
+- 引擎**无需依赖 Dynamo SDK**，只需按约定格式发 ZMQ 消息
+- 事件 ID 单调递增即可，不强制持久化
+- vLLM 通过 `vllm.distributed.kv_events.ZmqEventPublisher` 实现
+
+#### 方式二：直接 API 调用（引擎无 ZMQ 支持时）
+
+在引擎代码中显式调用 `KvEventPublisher`：
 
 ```python
 from dynamo.llm import KvEventPublisher
 
-class CustomEnginePublisher:
+class CustomEngine:
     def __init__(self, component, worker_id: int, block_size: int):
+        # 直接创建发布器（非 ZMQ 模式）
         self.kv_publisher = KvEventPublisher(
             component=component,
             worker_id=worker_id,
             kv_block_size=block_size,
         )
-        self.event_id = 0
+        self._event_id = 0
     
-    def on_blocks_stored(self, token_ids: list[int], block_hashes: list[int]):
-        """KV 块分配后调用"""
-        self.event_id += 1
+    def allocate_kv_blocks(self, token_ids: list[int], block_hashes: list[int], parent_hash: int = None):
+        """KV 块分配后显式调用"""
+        self._event_id += 1
         self.kv_publisher.publish_stored(
-            event_id=self.event_id,
+            event_id=self._event_id,
             token_ids=token_ids,
-            block_hashes=block_hashes,      # 序列累积哈希，用于前缀匹配
+            block_hashes=block_hashes,
             num_block_tokens=[len(token_ids)],
-            parent_hash=parent_hash,        # 父块哈希（首块为 None）
+            parent_hash=parent_hash,
         )
     
-    def on_blocks_removed(self, block_hashes: list[int]):
-        """KV 块驱逐时调用"""
-        self.event_id += 1
+    def evict_kv_blocks(self, block_hashes: list[int]):
+        """KV 块驱逐时显式调用"""
+        self._event_id += 1
         self.kv_publisher.publish_removed(
-            event_id=self.event_id,
+            event_id=self._event_id,
             block_hashes=block_hashes,
         )
 ```
 
 **事件类型**：
 - `BlockStored`: 新块存入缓存
-- `BlockRemoved`: 块被驱逐
+- `BlockRemoved`: 块被驱逐  
 - `AllBlocksCleared`: 缓存重置
+
+**对比**：
+
+| 维度 | ZMQ 订阅方式 | 直接 API 调用 |
+|------|-------------|--------------|
+| **引擎依赖** | 无（只需 ZMQ 客户端） | 需引入 Dynamo SDK |
+| **耦合度** | 低（松耦合，引擎不感知 Dynamo） | 高（引擎代码显式调用） |
+| **适用场景** | 已有独立 KV 管理模块的引擎 | 自研引擎，可深度集成 |
+| **参考实现** | vLLM (`ZmqEventPublisher`) | TRT-LLM / SGLang 可选方案 |
 
 ### 8.4 PD 分离模式支持（可选）
 
